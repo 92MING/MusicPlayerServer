@@ -21,15 +21,16 @@ if GlobalValue.HasGlobalValue("musicFileRecordTable"):
     musicFileRecordTable = GlobalValue.GetGlobalValue("musicFileRecordTable")
 else:
     database.create_table(name="musicFileRecord",
-                          columns={"hash": str, "names": str, "users": str, "fileSize":int, "artists":str, "fileExt":str},
+                          columns={"hash": str, "names": str, "users": str, "albums":str,
+                                   "fileSize":int, "artists":str, "fileExt":str},
                           pk=["hash"],
                           not_null=["hash"],
                           if_not_exists=True)
     musicFileRecordTable = database["musicFileRecord"]
     GlobalValue.SetGlobalValue("musicFileRecordTable", musicFileRecordTable)
     musicFileRecordTable.create_index(["hash"], if_not_exists=True)
-    musicFileRecordTable.enable_fts(["names"], create_triggers=True, replace=False)
-    musicFileRecordTable.enable_fts(["artists"], create_triggers=True, replace=False)
+    if musicFileRecordTable.detect_fts() is None:
+        musicFileRecordTable.enable_fts(["names","artists","albums"], create_triggers=True, replace=False)
 
 # endregion
 
@@ -44,6 +45,7 @@ class MusicFileRecord(SingleClass):
     _hash = None
     _names = None
     _users = None
+    _albums = None
     _artists = None
     _fileExt = None
     _fileSize = None
@@ -61,6 +63,7 @@ class MusicFileRecord(SingleClass):
             thisObj._names = []
             thisObj._users = []
             thisObj._artists = []
+            thisObj._albums = []
             if len(MusicFileRecord._AllRecordList) > MUSIC_RECORD_POOL_SIZE:
                 lastObj = MusicFileRecord._AllRecordList[0]
                 MusicFileRecord._AllRecordList.remove(lastObj)
@@ -74,6 +77,8 @@ class MusicFileRecord(SingleClass):
                     thisObj._users = json.loads(record["users"])
                 if record['artists'] is not None and record['artists'] != "":
                     thisObj._artists = json.loads(record["artists"])
+                if record['albums'] is not None and record['albums'] != "":
+                    thisObj._albums = json.loads(record["albums"])
                 if record['fileExt'] is not None and record['fileExt'] != "":
                     thisObj._fileExt = record["fileExt"]
                 if record['fileSize'] is not None and record['fileSize'] != "":
@@ -92,6 +97,9 @@ class MusicFileRecord(SingleClass):
     @property
     def users(self):
         return tuple(self._users)
+    @property
+    def albums(self):
+        return tuple(self._albums)
     @property
     def artists(self):
         return tuple(self._artists)
@@ -121,6 +129,14 @@ class MusicFileRecord(SingleClass):
         if artist in self._artists:
             self._artists.remove(artist)
     @ChainFunc
+    def addAlbum(self, album:str):
+        if album not in self._albums:
+            self._albums.append(album)
+    @ChainFunc
+    def removeAlbum(self, album:str):
+        if album in self._albums:
+            self._albums.remove(album)
+    @ChainFunc
     def addUser(self, user:str):
         if user not in self._users:
             self._users.append(user)
@@ -143,6 +159,7 @@ class MusicFileRecord(SingleClass):
             "names": json.dumps(self._names),
             "users": json.dumps(self._users),
             "artists": json.dumps(self._artists),
+            "albums": json.dumps(self._albums),
             "fileExt": self._fileExt,
             "fileSize": self._fileSize
         }
@@ -153,12 +170,13 @@ class MusicFileRecord(SingleClass):
 
 class NATType(SingleEnum):
     Unknown = 0
-    OpenInternet = 1
-    FullCone = 2
-    SymmetricUDPFirewall = 3
-    RestrictNAT = 4
-    RestrictPortNAT = 5
-    SymmetricNAT = 6
+    Blocked = 1
+    OpenInternet = 2
+    FullCone = 3
+    SymmetricUDPFirewall = 4
+    RestrictNAT = 5
+    RestrictPortNAT = 6
+    SymmetricNAT = 7
 class User(SingleClass):
     _CurrentUsers = MultiKeyDict("id", "sid")  #(id / sid) -> User
 
@@ -261,7 +279,7 @@ class Server(SingleManager):
 
     def __init__(self):
         self.app = flask.Flask("Music Player Server")
-        self.socketio = SocketIO(self.app)
+        self.socketio = SocketIO(self.app, ping_timeout=5, ping_interval=5, cors_allowed_origins="*")
 
         # region login / logout
         @self.socketio.on('connect')
@@ -273,8 +291,24 @@ class Server(SingleManager):
             localIP = headers.get('localIP', None)
             port = headers.get('port', None)
             submask = headers.get('submask', None)
-            if id is None or ip is None or localIP is None:
+            if id is None:
+                print('no id, deny connection')
                 return False  # deny connection
+            if ip is None:
+                print('no ip, deny connection')
+                return False
+            if localIP is None:
+                print('no localIP, deny connection')
+                return False
+            if port is None:
+                print('no port, deny connection')
+                return False
+            if submask is None:
+                print('no submask, deny connection')
+                return False
+            if User.HasCurrentUser(id):
+                print('already logged in, deny connection')
+                return False
             natType = headers.get('natType', None)
             if natType is not None:
                 natType =NATType(int(natType))
@@ -303,9 +337,11 @@ class Server(SingleManager):
             hash = data["hash"]
             name = data["name"]
             artist = data["artist"]
+            album = data["album"]
             fileExt = data["fileExt"]
             fileSize = data["fileSize"]
-            print(f"uploadSong, hash:{hash}, name:{name}, artist:{artist}, fileExt:{fileExt}, fileSize:{fileSize}")
+            print(f"uploadSong, hash:{hash}, name:{name}, artist:{artist}, album:{album},"
+                  f"fileExt:{fileExt}, fileSize:{fileSize}")
             try:
                 _ = musicFileRecordTable.get(hash)
                 record = MusicFileRecord(hash)
@@ -316,20 +352,32 @@ class Server(SingleManager):
                     "names": json.dumps([name]) if name is not None else None,
                     "users": json.dumps([user.id]),
                     "artists": json.dumps([artist]) if artist is not None else None,
+                    "album": json.dumps([album]) if album is not None else None,
                     "fileExt": fileExt,
-                    "fileSize": fileSize
+                    "fileSize": int(fileSize) if fileSize is not None else None
                 })
+        @self.socketio.on('deleteSong')
+        def deleteSong(data):
+            '''data = {"hash":hash}'''
+            hash = data["hash"]
+            user = User.FindUserBySID(flask.request.sid)
+            print(f"deleteSong, hash:{hash}")
+            record = MusicFileRecord(hash)
+            record.removeUser(user)
+            #no need to delete record if no user holds it
         @self.socketio.on('findSong')
         def findSong(data):
             '''Return songs in json format(list[dict]). Each dict contains hash, names, artists, fileExt, fileSize'''
             keywords = data['keywords'].split(" ")
-            mode = data['mode'].lower() # "name" or "artist"
+            mode = data['mode'].lower() # "name" or "artist" or "album"
             if mode[-1]!='s':
                 mode += 's'
             findSQL = "%" + "%".join(keywords) + "%"
-            result = list(musicFileRecordTable.find(mode, "LIKE", findSQL, toTuple=True))
+            result = musicFileRecordTable.find(mode, "LIKE", findSQL, toTuple=True)
             print('findSong, keywords:', keywords, ', mode:', mode, ', result:', result)
-            return json.dumps(result)
+            if result is None:
+                return tuple()
+            return result
         @self.socketio.on('findSongHolders')
         def findSongHolders(data):
             '''return userIDs holding the resources, in json format'''
@@ -342,12 +390,12 @@ class Server(SingleManager):
                 if len(result) == USER_TRACK_LIMIT:
                     break
             print(f'findSongHolders, hash:{hash}, holders:{recordHolderIDs}, result:{result}')
-            return json.dumps(result)
-        @self.socketio.on('/help_connect_to')
-        def help_connect_to():
+            return tuple(result)
+        @self.socketio.on('help_connect_to')
+        def help_connect_to(data):
             '''help user to connect to other users'''
-            targetID = flask.request.args.get('targetID')
-            selfID = flask.request.args.get('selfID')
+            targetID = data['targetID']
+            selfID = User.FindUserBySID(flask.request.sid).id
 
             if not User.HasCurrentUser(targetID):
                 ret ={'reason':ConnectionFailReason.UserNotFound.name, 'code':ConnectionFailReason.UserNotFound.value}
@@ -368,8 +416,7 @@ class Server(SingleManager):
                         self.help_TURN_connect(targetUser, thisUser)
                     else:
                         print(f'subnet direct connect success')
-                emit("direct_connect", {'ip':targetUser.ip, 'localIP': targetUser.localIP, 'port':targetUser.port}, to=thisUser.sid,
-                     callback=onDirectConnectFailHandler)
+                self.help_direct_connect(targetUser.localIP, targetUser.port, thisUser, onDirectConnectFailHandler)
                 return
 
             if (targetUser.natType == NATType.SymmetricNAT or thisUser.natType == NATType.SymmetricNAT
@@ -398,7 +445,7 @@ class Server(SingleManager):
             else:
                 #both open internet
                 print('both open internet, trying direct connect')
-                self.help_direct_connect(targetUser, thisUser)
+                self.help_direct_connect(targetUser.ip, targetUser.port, thisUser)
 
     def help_TURN_connect(self, user1:User, user2:User):
         if user2.id in user1.TURN_connecting or user1.id in user2.TURN_connecting:
@@ -416,8 +463,11 @@ class Server(SingleManager):
         user1.TURN_connecting.append(user2.sid)
         user2.TURN_connecting.append(user1.sid)
 
-    def help_direct_connect(self, targetUser:User, connector:User):
-        emit("direct_connect", {'ip': targetUser.ip, 'localIP':targetUser.localIP, 'port': targetUser.port}, to=connector.sid)
+    def help_direct_connect(self, targetIP:str, targetPort:int, connector:User, callback=None):
+        if callback:
+            emit("direct_connect", {'ip': targetIP, 'port': targetPort}, to=connector.sid, callback=callback)
+        else:
+            emit("direct_connect", {'ip': targetIP, 'port': targetPort}, to=connector.sid)
 
     def help_repeat_udp_hole_punch(self, targetUser:User, puncher:User):
         # UDP hole punch by sending udp repeatedly
@@ -429,7 +479,7 @@ class Server(SingleManager):
         # endregion
 
     def run(self):
-        self.socketio.run(self.app, ping_timeout=8, ping_interval=8)
+        self.socketio.run(self.app, debug=True, host='0.0.0.0', port=9192, allow_unsafe_werkzeug=True)
 
 # endregion
 
