@@ -31,7 +31,6 @@ else:
     musicFileRecordTable.create_index(["hash"], if_not_exists=True)
     if musicFileRecordTable.detect_fts() is None:
         musicFileRecordTable.enable_fts(["names","artists","albums"], create_triggers=True, replace=False)
-
 # endregion
 
 # region classes
@@ -82,9 +81,9 @@ class MusicFileRecord(SingleClass):
                 if record['fileExt'] is not None and record['fileExt'] != "":
                     thisObj._fileExt = record["fileExt"]
                 if record['fileSize'] is not None and record['fileSize'] != "":
-                    thisObj._fileSize = record["fileSize"]
+                    thisObj._fileSize = int(record["fileSize"])
             except NotFoundError:
-                raise Exception(f"music file hash:{hash} found")
+                raise Exception(f"music file hash:{hash} not found")
         return thisObj
 
 # region properties
@@ -108,6 +107,8 @@ class MusicFileRecord(SingleClass):
         return self._fileExt
     @property
     def fileSize(self):
+        if self._fileSize is not None and not isinstance(self._fileSize, int):
+            self._fileSize = int(self._fileSize)
         return self._fileSize
 # endregion
 
@@ -138,10 +139,14 @@ class MusicFileRecord(SingleClass):
             self._albums.remove(album)
     @ChainFunc
     def addUser(self, user:str):
+        if not isinstance(user, str):
+            raise TypeError(f"user ID must be str. {type(user)} given")
         if user not in self._users:
             self._users.append(user)
     @ChainFunc
     def removeUser(self, user:str):
+        if not isinstance(user, str):
+            raise TypeError(f"user ID must be str. {type(user)} given")
         if user in self._users:
             self._users.remove(user)
     @ChainFunc
@@ -149,9 +154,10 @@ class MusicFileRecord(SingleClass):
         if fileExt is not None and (self._fileExt is None or fileExt != self._fileExt):
             self._fileExt = fileExt
     @ChainFunc
-    def setFileSize(self, fileSize:int):
-        if fileSize is not None and (self._fileSize is None or fileSize > self._fileSize):
-            self._fileSize = fileSize
+    def setFileSize(self, fileSize):
+        _fileSize = int(fileSize)
+        if fileSize is not None and (self._fileSize is None or _fileSize > self.fileSize):
+            self._fileSize = _fileSize
 
     def serialize(self):
         data  = {
@@ -164,9 +170,13 @@ class MusicFileRecord(SingleClass):
             "fileSize": self._fileSize
         }
         return data
+
     @ChainFunc.final
     def save(self):
-        musicFileRecordTable.update(self.serialize())
+        data = self.serialize()
+        hash = data.pop("hash")
+        musicFileRecordTable.update(hash, data)
+# endregion
 
 class NATType(SingleEnum):
     Unknown = 0
@@ -281,7 +291,6 @@ class Server(SingleManager):
         self.app = flask.Flask("Music Player Server")
         self.socketio = SocketIO(self.app, ping_timeout=5, ping_interval=5, cors_allowed_origins="*")
 
-        # region login / logout
         @self.socketio.on('connect')
         def login():
             sid = flask.request.sid
@@ -327,12 +336,9 @@ class Server(SingleManager):
                     other.TURN_connecting.remove(user.id)
                     emit('TURN_disconnect', {'id':user.id}, to=other.sid)
             User.RemoveUserBySID(sid)
-        # endregion
-
-        # region song
-        @self.socketio.on("uploadSong")
+        @self.socketio.on('uploadSong')
         def uploadSong(data):
-            '''data = {"hash":hash, "name":name, "artist":artist, "fileExt":fileExt, "fileSize":fileSize}'''
+            '''data = {"hash", "name", "artist", "album", "fileExt", "fileSize"}'''
             user = User.FindUserBySID(flask.request.sid)
             hash = data["hash"]
             name = data["name"]
@@ -345,17 +351,19 @@ class Server(SingleManager):
             try:
                 _ = musicFileRecordTable.get(hash)
                 record = MusicFileRecord(hash)
-                record.addName(name).addUser(user).addArtist(artist).setFileExt(fileExt).setFileSize(fileSize)
+                record.addName(name).addUser(user.id).addArtist(artist).addAlbum(album).setFileExt(fileExt).setFileSize(fileSize)
             except NotFoundError:
+                print(f'no muisc {hash} found, create new record')
                 musicFileRecordTable.insert({
                     "hash": hash,
                     "names": json.dumps([name]) if name is not None else None,
                     "users": json.dumps([user.id]),
                     "artists": json.dumps([artist]) if artist is not None else None,
-                    "album": json.dumps([album]) if album is not None else None,
+                    "albums": json.dumps([album]) if album is not None else None,
                     "fileExt": fileExt,
                     "fileSize": int(fileSize) if fileSize is not None else None
                 })
+                MusicFileRecord(hash)
         @self.socketio.on('deleteSong')
         def deleteSong(data):
             '''data = {"hash":hash}'''
@@ -363,7 +371,7 @@ class Server(SingleManager):
             user = User.FindUserBySID(flask.request.sid)
             print(f"deleteSong, hash:{hash}")
             record = MusicFileRecord(hash)
-            record.removeUser(user)
+            record.removeUser(user.id)
             #no need to delete record if no user holds it
         @self.socketio.on('findSong')
         def findSong(data):
@@ -377,10 +385,10 @@ class Server(SingleManager):
             print('findSong, keywords:', keywords, ', mode:', mode, ', result:', result)
             if result is None:
                 return tuple()
-            return result
+            return tuple(result)
         @self.socketio.on('findSongHolders')
         def findSongHolders(data):
-            '''return userIDs holding the resources, in json format'''
+            '''return userIDs holding the resources'''
             hash = data['hash'] #song hash
             recordHolderIDs = MusicFileRecord(hash).users
             result = []
@@ -391,7 +399,7 @@ class Server(SingleManager):
                     break
             print(f'findSongHolders, hash:{hash}, holders:{recordHolderIDs}, result:{result}')
             return tuple(result)
-        @self.socketio.on('help_connect_to')
+        @self.socketio.on('requestSong')
         def help_connect_to(data):
             '''help user to connect to other users'''
             targetID = data['targetID']
@@ -455,11 +463,11 @@ class Server(SingleManager):
                 #TURN failed, give up
                 if failer.id in target.TURN_connecting:
                     target.TURN_connecting.remove(failer.id)
-                    emit("TURN_disconnect", {'sid': failer.sid}, to=target.sid)
+                    emit("TURN_disconnect", {'sid': failer.sid, 'id':failer.id}, to=target.sid)
         user1Handler = partial(TURNFailHandler, user2, user1)
         user2Handler = partial(TURNFailHandler, user1, user2)
-        emit("TURN_connect", {'sid': user1.sid}, to=user2.sid, callback=user1Handler)
-        emit("TURN_connect", {'sid': user2.sid}, to=user1.sid, callback=user2Handler)
+        emit("TURN_connect", {'sid': user1.sid, 'id':user1.id}, to=user2.sid, callback=user1Handler)
+        emit("TURN_connect", {'sid': user2.sid, 'id':user2.id}, to=user1.sid, callback=user2Handler)
         user1.TURN_connecting.append(user2.sid)
         user2.TURN_connecting.append(user1.sid)
 
@@ -469,12 +477,12 @@ class Server(SingleManager):
         else:
             emit("direct_connect", {'ip': targetIP, 'port': targetPort}, to=connector.sid)
 
-    def help_repeat_udp_hole_punch(self, targetUser:User, puncher:User):
+    def help_repeat_udp_hole_punch(self, targetIP:str, targetPort:int, puncher:User):
         # UDP hole punch by sending udp repeatedly
-        emit("udpHolePunch_repeat", {'ip': targetUser.ip, 'localIP':targetUser.localIP, 'port': targetUser.port}, to=puncher.sid)
-    def help_normal_udp_hole_punch(self, targetUser:User, puncher:User):
+        emit("udpHolePunch_repeat", {'ip': targetIP, 'port': targetPort}, to=puncher.sid)
+    def help_normal_udp_hole_punch(self, targetIP:str, targetPort:int, puncher:User):
         # normal udp hole punch, only send once
-        emit("udpHolePunch_once", {'ip': targetUser.ip, 'localIP':targetUser.localIP, 'port': targetUser.port}, to=puncher.sid)
+        emit("udpHolePunch_once", {'ip': targetIP, 'port': targetPort}, to=puncher.sid)
 
         # endregion
 
